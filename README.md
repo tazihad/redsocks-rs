@@ -52,12 +52,14 @@ cargo build --release
 
 The optimized binary will be created at:
 ```bash
-./target/release/redsocks-rs
+./target/release/redsocks
 ```
 
 To install to system path:
 ```bash
-sudo cp target/release/redsocks-rs /usr/local/bin/redsocks
+sudo cp target/release/redsocks /usr/local/bin/redsocks
+# Optional: create a redsocks-rs symlink for explicit invocation
+sudo ln -sf /usr/local/bin/redsocks /usr/local/bin/redsocks-rs
 ```
 
 ---

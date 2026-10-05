@@ -1,10 +1,14 @@
 [package]
 name = "redsocks-rs"
-version = "0.5.0"
+version = "0.1.0"
 edition = "2021"
 authors = ["Antigravity"]
 description = "High-performance transparent TCP-to-proxy and UDP-to-proxy redirector in Rust, reimplementing redsocks"
 license = "Apache-2.0"
+
+[[bin]]
+name = "redsocks"
+path = "src/main.rs"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -21,3 +25,10 @@ thiserror = "2"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
