@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+use tokio::sync::oneshot;
 
-#[derive(Debug, Clone)]
 pub struct ClientSessionInfo {
     pub client_addr: SocketAddr,
     pub dest_addr: SocketAddr,
@@ -13,6 +13,7 @@ pub struct ClientSessionInfo {
     pub last_activity: Instant,
     pub bytes_up: u64,
     pub bytes_down: u64,
+    pub abort_tx: Option<oneshot::Sender<()>>,
 }
 
 #[derive(Default)]
@@ -47,11 +48,19 @@ impl StatsTracker {
             last_activity: now,
             bytes_up: 0,
             bytes_down: 0,
+            abort_tx: None,
         };
 
         let mut lock = self.clients.lock().unwrap();
         lock.insert(id, info);
         id
+    }
+
+    pub fn set_abort_tx(&self, id: usize, tx: oneshot::Sender<()>) {
+        let mut lock = self.clients.lock().unwrap();
+        if let Some(info) = lock.get_mut(&id) {
+            info.abort_tx = Some(tx);
+        }
     }
 
     pub fn update_activity(&self, id: usize, bytes_up: u64, bytes_down: u64) {
@@ -74,13 +83,26 @@ impl StatsTracker {
         self.active_connections.load(Ordering::Relaxed)
     }
 
+    pub fn evict_idle_connections(&self, max_idle: Duration) -> usize {
+        let mut lock = self.clients.lock().unwrap();
+        let now = Instant::now();
+        let mut evicted = 0;
+        for (id, info) in lock.iter_mut() {
+            if now.duration_since(info.last_activity) >= max_idle {
+                if let Some(tx) = info.abort_tx.take() {
+                    let _ = tx.send(());
+                    evicted += 1;
+                    log::debug!("Evicted idle connection #{} ({})", id, info.client_addr);
+                }
+            }
+        }
+        evicted
+    }
+
     pub fn dump_clients(&self) {
         let lock = self.clients.lock().unwrap();
         let now = Instant::now();
-        log::info!(
-            "=== [SIGUSR1] Dumping active client list ({} clients) ===",
-            lock.len()
-        );
+        log::info!("=== [SIGUSR1] Dumping active client list ({} clients) ===", lock.len());
 
         for (id, client) in lock.iter() {
             let age = now.duration_since(client.connected_at).as_secs_f64();

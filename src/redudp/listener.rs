@@ -7,8 +7,55 @@ use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 
+#[cfg(target_os = "linux")]
+use tokio::io::unix::AsyncFd;
+
 use crate::config::types::RedudpConfig;
 use crate::redudp::session::run_session_worker;
+
+#[derive(Default)]
+pub struct BoundSocketCache {
+    sockets: Mutex<HashMap<SocketAddr, Arc<UdpSocket>>>,
+}
+
+impl BoundSocketCache {
+    pub async fn get_or_bind(&self, src_addr: SocketAddr) -> io::Result<Arc<UdpSocket>> {
+        let mut lock = self.sockets.lock().await;
+        if let Some(sock) = lock.get(&src_addr) {
+            return Ok(sock.clone());
+        }
+
+        let domain = match src_addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+
+        let socket = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))?;
+        socket.set_reuse_address(true)?;
+
+        #[cfg(target_os = "linux")]
+        {
+            let on: libc::c_int = 1;
+            unsafe {
+                let _ = libc::setsockopt(
+                    socket.as_raw_fd(),
+                    libc::SOL_IP,
+                    libc::IP_TRANSPARENT,
+                    &on as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&on) as libc::socklen_t,
+                );
+            }
+        }
+
+        socket.set_nonblocking(true)?;
+        socket.bind(&src_addr.into())?;
+
+        let std_sock: std::net::UdpSocket = socket.into();
+        let tokio_sock = Arc::new(UdpSocket::from_std(std_sock)?);
+        lock.insert(src_addr, tokio_sock.clone());
+        Ok(tokio_sock)
+    }
+}
 
 pub struct RedudpListener {
     config: RedudpConfig,
@@ -59,7 +106,6 @@ impl RedudpListener {
 
         socket.bind(&bind_addr.into())?;
         let std_socket: std::net::UdpSocket = socket.into();
-        let udp_socket = Arc::new(UdpSocket::from_std(std_socket)?);
 
         log::info!(
             "redudp listening on {} [mode: {}] -> proxy {}:{}",
@@ -71,30 +117,30 @@ impl RedudpListener {
 
         let (reply_tx, mut reply_rx) = mpsc::channel::<(SocketAddr, SocketAddr, Vec<u8>)>(1024);
 
-        // Outbound replies to client task
-        let send_socket = udp_socket.clone();
+        let socket_cache = Arc::new(BoundSocketCache::default());
+        let socket_cache_clone = socket_cache.clone();
+        let fallback_socket = Arc::new(UdpSocket::from_std(std_socket.try_clone()?)?);
+        let fallback_send = fallback_socket.clone();
         let config_clone = self.config.clone();
+
+        // Outbound reply forwarder task
         tokio::spawn(async move {
             while let Some((client_addr, dest_addr, payload)) = reply_rx.recv().await {
                 if config_clone.is_tproxy() {
-                    #[cfg(target_os = "linux")]
-                    {
-                        // Send from spoofed dest_addr using IP_TRANSPARENT socket
-                        let send_res = send_tproxy_reply(dest_addr, client_addr, &payload);
-                        if let Err(e) = send_res {
-                            log::debug!(
-                                "TPROXY send reply failed (falling back to listener): {}",
-                                e
-                            );
-                            let _ = send_socket.send_to(&payload, client_addr).await;
+                    match socket_cache_clone.get_or_bind(dest_addr).await {
+                        Ok(sock) => {
+                            if let Err(e) = sock.send_to(&payload, client_addr).await {
+                                log::debug!("TPROXY cached socket send error: {}, falling back", e);
+                                let _ = fallback_send.send_to(&payload, client_addr).await;
+                            }
+                        }
+                        Err(e) => {
+                            log::debug!("TPROXY bind to {} failed: {}, falling back", dest_addr, e);
+                            let _ = fallback_send.send_to(&payload, client_addr).await;
                         }
                     }
-                    #[cfg(not(target_os = "linux"))]
-                    {
-                        let _ = send_socket.send_to(&payload, client_addr).await;
-                    }
                 } else {
-                    let _ = send_socket.send_to(&payload, client_addr).await;
+                    let _ = fallback_send.send_to(&payload, client_addr).await;
                 }
             }
         });
@@ -117,14 +163,35 @@ impl RedudpListener {
             }
         });
 
+        #[cfg(target_os = "linux")]
+        let async_listener = AsyncFd::new(std_socket)?;
+        #[cfg(not(target_os = "linux"))]
+        let listener_sock = fallback_socket;
+
         let mut buf = vec![0u8; 65535];
 
         loop {
-            let (len, client_addr) = match udp_socket.recv_from(&mut buf).await {
-                Ok(res) => res,
-                Err(e) => {
-                    log::warn!("UDP listener recv_from error: {}", e);
-                    continue;
+            #[cfg(target_os = "linux")]
+            let (len, client_addr, orig_dst) = {
+                let mut guard = async_listener.readable().await?;
+                match guard.try_io(|inner| recv_udp_pkt_tproxy(inner.get_ref().as_raw_fd(), &mut buf)) {
+                    Ok(Ok(res)) => res,
+                    Ok(Err(e)) => {
+                        log::warn!("UDP recvmsg error: {}", e);
+                        continue;
+                    }
+                    Err(_would_block) => continue,
+                }
+            };
+
+            #[cfg(not(target_os = "linux"))]
+            let (len, client_addr, orig_dst): (usize, SocketAddr, Option<SocketAddr>) = {
+                match listener_sock.recv_from(&mut buf).await {
+                    Ok((n, addr)) => (n, addr, None),
+                    Err(e) => {
+                        log::warn!("UDP recv_from error: {}", e);
+                        continue;
+                    }
                 }
             };
 
@@ -132,27 +199,14 @@ impl RedudpListener {
 
             // Determine target destination address
             let dest_addr = if is_tproxy {
-                #[cfg(target_os = "linux")]
-                {
-                    // In TPROXY, try getting IP_ORIGDSTADDR or default to static/loopback
-                    get_orig_dst_addr(udp_socket.as_raw_fd()).unwrap_or_else(|| {
-                        SocketAddr::new(
-                            self.config
-                                .dest_ip
-                                .unwrap_or(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
-                            self.config.dest_port.unwrap_or(53),
-                        )
-                    })
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
+                orig_dst.unwrap_or_else(|| {
                     SocketAddr::new(
                         self.config
                             .dest_ip
                             .unwrap_or(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
                         self.config.dest_port.unwrap_or(53),
                     )
-                }
+                })
             } else {
                 SocketAddr::new(
                     self.config
@@ -179,12 +233,7 @@ impl RedudpListener {
                     if let Err(e) =
                         run_session_worker(cfg, client_addr, dest_addr, rx, reply_tx_clone).await
                     {
-                        log::debug!(
-                            "redudp session {} -> {} ended: {}",
-                            client_addr,
-                            dest_addr,
-                            e
-                        );
+                        log::debug!("redudp session {} -> {} ended: {}", client_addr, dest_addr, e);
                     }
                 });
             }
@@ -193,50 +242,60 @@ impl RedudpListener {
 }
 
 #[cfg(target_os = "linux")]
-fn get_orig_dst_addr(fd: std::os::unix::io::RawFd) -> Option<SocketAddr> {
-    unsafe {
-        let mut addr: libc::sockaddr_in = std::mem::zeroed();
-        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+fn recv_udp_pkt_tproxy(
+    fd: std::os::unix::io::RawFd,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr, Option<SocketAddr>)> {
+    let mut client_addr: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let mut control_buf = [0u8; 1024];
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
 
-        let ret = libc::getsockopt(
-            fd,
-            libc::SOL_IP,
-            libc::SO_ORIGINAL_DST,
-            &mut addr as *mut _ as *mut libc::c_void,
-            &mut len,
-        );
+    msg.msg_name = &mut client_addr as *mut _ as *mut libc::c_void;
+    msg.msg_namelen = std::mem::size_of_val(&client_addr) as libc::socklen_t;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control_buf.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = control_buf.len() as _;
 
-        if ret == 0 {
-            let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
-            let port = u16::from_be(addr.sin_port);
-            Some(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
+    let res = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+    if res < 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let client_sockaddr = unsafe {
+        if client_addr.ss_family as libc::c_int == libc::AF_INET {
+            let sin: &libc::sockaddr_in = std::mem::transmute(&client_addr);
+            let ip = Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            let port = u16::from_be(sin.sin_port);
+            SocketAddr::V4(std::net::SocketAddrV4::new(ip, port))
+        } else if client_addr.ss_family as libc::c_int == libc::AF_INET6 {
+            let sin6: &libc::sockaddr_in6 = std::mem::transmute(&client_addr);
+            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            let port = u16::from_be(sin6.sin6_port);
+            SocketAddr::V6(std::net::SocketAddrV6::new(ip, port, sin6.sin6_flowinfo, sin6.sin6_scope_id))
         } else {
-            None
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Unknown address family"));
+        }
+    };
+
+    let mut dest_sockaddr = None;
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
+        while !cmsg.is_null() {
+            if (*cmsg).cmsg_level == libc::SOL_IP && (*cmsg).cmsg_type == libc::IP_ORIGDSTADDR {
+                let sin: *const libc::sockaddr_in = libc::CMSG_DATA(cmsg) as *const _;
+                let ip = Ipv4Addr::from(u32::from_be((*sin).sin_addr.s_addr));
+                let port = u16::from_be((*sin).sin_port);
+                dest_sockaddr = Some(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)));
+                break;
+            }
+            cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
         }
     }
-}
 
-#[cfg(target_os = "linux")]
-fn send_tproxy_reply(src_addr: SocketAddr, dst_addr: SocketAddr, payload: &[u8]) -> io::Result<()> {
-    let socket = socket2::Socket::new(
-        socket2::Domain::IPV4,
-        socket2::Type::DGRAM,
-        Some(socket2::Protocol::UDP),
-    )?;
-
-    socket.set_reuse_address(true)?;
-    let on: libc::c_int = 1;
-    unsafe {
-        let _ = libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_IP,
-            libc::IP_TRANSPARENT,
-            &on as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&on) as libc::socklen_t,
-        );
-    }
-
-    socket.bind(&src_addr.into())?;
-    socket.send_to(payload, &dst_addr.into())?;
-    Ok(())
+    Ok((res as usize, client_sockaddr, dest_sockaddr))
 }

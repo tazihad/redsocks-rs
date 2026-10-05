@@ -10,7 +10,7 @@ use crate::config::types::{BaseConfig, ProxyType, RedsocksConfig};
 use crate::proxy::http_connect::HttpConnectResult;
 use crate::proxy::*;
 use crate::redirector::Redirector;
-use crate::redsocks::pump::run_duplex_pump;
+use crate::redsocks::pump::run_pump;
 use crate::stats::StatsTracker;
 
 pub struct RedsocksInstance {
@@ -56,11 +56,12 @@ impl RedsocksInstance {
         let listener = TcpListener::from_std(std_listener)?;
 
         log::info!(
-            "redsocks [{:?}] listening on {} -> proxy {}:{}",
+            "redsocks [{:?}] listening on {} -> proxy {}:{} (splice: {})",
             self.config.proxy_type,
             bind_addr,
             self.config.ip,
-            self.config.port
+            self.config.port,
+            self.config.splice
         );
 
         let idle_timeout = if self.base_config.connpres_idle_timeout > 0 {
@@ -73,13 +74,23 @@ impl RedsocksInstance {
             // Check connection limit
             let max_conn = self.base_config.redsocks_conn_max as usize;
             if max_conn > 0 && self.stats.active_count() >= max_conn {
-                log::warn!(
-                    "Connection limit hit ({}/{}), throttling accept",
-                    self.stats.active_count(),
-                    max_conn
-                );
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                continue;
+                let max_idle = if self.base_config.connpres_idle_timeout > 0 {
+                    Duration::from_secs(self.base_config.connpres_idle_timeout)
+                } else {
+                    Duration::from_secs(7440)
+                };
+                let evicted = self.stats.evict_idle_connections(max_idle);
+                if evicted > 0 {
+                    log::info!("Connection limit hit: evicted {} idle connections", evicted);
+                } else {
+                    log::warn!(
+                        "Connection limit hit ({}/{}), throttling accept",
+                        self.stats.active_count(),
+                        max_conn
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
             }
 
             let (client_stream, client_addr) = match listener.accept().await {
@@ -118,6 +129,8 @@ impl RedsocksInstance {
         let client_id = self
             .stats
             .register_client(client_addr, dest_addr, &proxy_type_str);
+        let (abort_tx, mut abort_rx) = tokio::sync::oneshot::channel::<()>();
+        self.stats.set_abort_tx(client_id, abort_tx);
 
         if self.base_config.log_info {
             log::info!(
@@ -130,18 +143,20 @@ impl RedsocksInstance {
             );
         }
 
-        let res = match self.config.proxy_type {
+        let pump_future = async {
+            let res: io::Result<()> = match self.config.proxy_type {
             ProxyType::Socks4 => {
                 let mut proxy_stream =
                     TcpStream::connect((self.config.ip.as_str(), self.config.port)).await?;
                 apply_tcp_keepalive(&proxy_stream, &self.base_config)?;
                 socks4_connect(&mut proxy_stream, dest_addr, self.config.login.as_deref()).await?;
-                run_duplex_pump(
+                run_pump(
                     client_stream,
                     proxy_stream,
                     self.stats.clone(),
                     client_id,
                     idle_timeout,
+                    self.config.splice,
                 )
                 .await
             }
@@ -156,12 +171,13 @@ impl RedsocksInstance {
                     self.config.password.as_deref(),
                 )
                 .await?;
-                run_duplex_pump(
+                run_pump(
                     client_stream,
                     proxy_stream,
                     self.stats.clone(),
                     client_id,
                     idle_timeout,
+                    self.config.splice,
                 )
                 .await
             }
@@ -182,12 +198,13 @@ impl RedsocksInstance {
 
                 match connect_res {
                     HttpConnectResult::Success => {
-                        run_duplex_pump(
+                        run_pump(
                             client_stream,
                             proxy_stream,
                             self.stats.clone(),
                             client_id,
                             idle_timeout,
+                            self.config.splice,
                         )
                         .await
                     }
@@ -203,14 +220,25 @@ impl RedsocksInstance {
                     TcpStream::connect((self.config.ip.as_str(), self.config.port)).await?;
                 apply_tcp_keepalive(&proxy_stream, &self.base_config)?;
                 http_relay_handshake(&mut client_stream, dest_addr, &mut proxy_stream).await?;
-                run_duplex_pump(
+                run_pump(
                     client_stream,
                     proxy_stream,
                     self.stats.clone(),
                     client_id,
                     idle_timeout,
+                    self.config.splice,
                 )
                 .await
+            }
+        };
+        res
+    };
+
+        let res = tokio::select! {
+            res = pump_future => res,
+            _ = &mut abort_rx => {
+                log::info!("Connection {} -> {} evicted due to idle pressure", client_addr, dest_addr);
+                Ok(())
             }
         };
 
