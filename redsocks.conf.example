@@ -1,0 +1,116 @@
+base {
+	// debug: detailed connection progress
+	log_debug = off;
+
+	// info: connection start and teardown logs
+	log_info = on;
+
+	/* Possible `log` values:
+	 *   stderr
+	 *   "file:/var/log/redsocks.log"
+	 *   "syslog:daemon"
+	 */
+	log = stderr;
+
+	// Detach from console and run as background daemon
+	daemon = off;
+
+	/* Privilege dropping and chroot (requires root on startup)
+	 * Debian/Ubuntu typically uses `nobody` / `nogroup`.
+	 */
+	// user = nobody;
+	// group = nogroup;
+	// chroot = "/var/chroot";
+
+	/* Redirector backend:
+	 *   iptables   - Linux netfilter SO_ORIGINAL_DST (IPv4 and IPv6)
+	 *   generic    - generic fallback using getsockname
+	 */
+	redirector = iptables;
+
+	/* TCP keepalive settings (in seconds, 0 = system default) */
+	// tcp_keepalive_time = 0;
+	// tcp_keepalive_probes = 0;
+	// tcp_keepalive_intvl = 0;
+
+	/* Maximum open file descriptors (ulimit -n, 0 = do not change) */
+	// rlimit_nofile = 65536;
+
+	/* Maximum concurrent client connections (0 = unlimited) */
+	// redsocks_conn_max = 4096;
+
+	/* Close connections idle for N seconds (RFC 5382 default is 7440 seconds = 2h 4m) */
+	// connpres_idle_timeout = 7440;
+}
+
+redsocks {
+	/* Local address and port for iptables to redirect to */
+	local_ip = 127.0.0.1;
+	local_port = 12345;
+
+	// TCP listen backlog queue
+	listenq = 128;
+
+	// Zero-copy kernel splice optimization
+	splice = true;
+
+	// Upstream proxy server IP or hostname and port
+	ip = 127.0.0.1;
+	port = 1080;
+
+	// Supported types: socks4, socks5, http-connect, http-relay
+	type = socks5;
+
+	// Optional authentication credentials
+	// login = "username";
+	// password = "password";
+
+	// Disclose original client IP in http-connect (false, X-Forwarded-For, Forwarded_ip, Forwarded_ipport)
+	// disclose_src = false;
+
+	// Action on proxy error: close or forward_http_err
+	// on_proxy_fail = close;
+}
+
+redudp {
+	// Local UDP port to intercept
+	local_ip = 127.0.0.1;
+	local_port = 10053;
+
+	// Upstream SOCKS5 proxy server supporting UDP ASSOCIATE
+	ip = 127.0.0.1;
+	port = 1080;
+	// login = "username";
+	// password = "password";
+
+	/* For REDIRECT mode, set dest_ip and dest_port to a fixed destination:
+	 * For TPROXY mode, leave them commented out to dynamically discover destination.
+	 */
+	dest_ip = 8.8.8.8;
+	dest_port = 53;
+
+	// UDP session idle timeout in seconds
+	udp_timeout = 30;
+	udp_timeout_stream = 180;
+	max_pktqueue = 5;
+}
+
+dnstc {
+	// Fake DNS server returning Truncated (TC=1) reply to force RFC-compliant resolvers to retry via TCP
+	local_ip = 127.0.0.1;
+	local_port = 5300;
+}
+
+dnsu2t {
+	// DNS UDP-to-TCP multiplexing relay
+	local_ip = 127.0.0.1;
+	local_port = 5313;
+
+	// Upstream recursive DNS resolver (TCP)
+	remote_ip = 8.8.8.8;
+	remote_port = 53;
+
+	// Maximum concurrent in-flight DNS queries
+	inflight_max = 16;
+	remote_timeout = 30;
+}

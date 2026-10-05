@@ -1,0 +1,23 @@
+[package]
+name = "redsocks-rs"
+version = "0.5.0"
+edition = "2021"
+authors = ["Antigravity"]
+description = "High-performance transparent TCP-to-proxy and UDP-to-proxy redirector in Rust, reimplementing redsocks"
+license = "Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+socket2 = { version = "0.5", features = ["all"] }
+libc = "0.2"
+nix = { version = "0.29", features = ["net", "user", "fs", "signal", "resource", "process"] }
+md-5 = "0.10"
+base64 = "0.22"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4.5", features = ["derive"] }
+rand = "0.8"
+thiserror = "2"
+
+[dev-dependencies]
+tokio-test = "0.4"

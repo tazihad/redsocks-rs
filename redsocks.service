@@ -1,0 +1,18 @@
+[Unit]
+Description=redsocks - transparent TCP-to-proxy redirector (Rust implementation)
+After=network.target network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/redsocks -c /etc/redsocks.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+# Sandboxing & security capabilities
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_SETUID CAP_SETGID CAP_SYS_CHROOT
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
