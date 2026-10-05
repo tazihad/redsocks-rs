@@ -37,29 +37,123 @@ A complete, high-performance, modern reimplementation of [darkk/redsocks](https:
 
 ---
 
-## Installation & Building
+## Prerequisites
 
-### Prerequisites
+### 1. System Requirements & Kernel Modules
+- **Linux Kernel**: 3.2+ (tested up to 6.x) with Netfilter support:
+  - `iptable_nat` / `nf_nat` (for TCP `REDIRECT` and `SO_ORIGINAL_DST`)
+  - `xt_TPROXY` and `nf_defrag_ipv4` (optional, for UDP `redudp` dynamic TPROXY mode)
+  - `xt_owner` (for user/group-based redirection `--uid-owner` / `--gid-owner`)
+  - Linux `splice(2)` support (standard on modern Linux kernels)
 
-- Rust toolchain (1.75+ or newer, with cargo)
-- Linux (for netfilter `SO_ORIGINAL_DST`, `IP_TRANSPARENT`, and `splice`)
+### 2. Package Dependencies
+Install `iptables`, `iproute2`, and `curl` on your system:
 
-### Build Release Binary
+- **Debian / Ubuntu / Raspberry Pi OS**:
+  ```bash
+  sudo apt update && sudo apt install -y iptables iproute2 curl
+  ```
+- **Arch Linux / Manjaro**:
+  ```bash
+  sudo pacman -Sy iptables iproute2 curl
+  ```
+- **Fedora / RHEL / Rocky / AlmaLinux**:
+  ```bash
+  sudo dnf install -y iptables iproute curl
+  ```
+- **Alpine Linux**:
+  ```bash
+  apk add iptables iproute2 curl
+  ```
+
+*(If compiling from source, a Rust toolchain `1.75+` is also required: `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)*
+
+---
+
+## Installation & File Placement
+
+### File Hierarchy Standard (Where to Put Files)
+
+When installing `redsocks-rs` onto a Linux system, place the files in standard locations as follows:
+
+| Source File | Destination Path | Permissions | Purpose |
+| :--- | :--- | :--- | :--- |
+| **`redsocks`** (executable) | `/usr/local/bin/redsocks` | `0755` (`rwxr-xr-x`, root:root) | Main compiled redirector daemon |
+| **`redsocks-rs`** (symlink) | `/usr/local/bin/redsocks-rs` | `0777` (symlink) | Optional convenience alias pointing to `redsocks` |
+| **`redsocks.conf.example`** | `/etc/redsocks.conf` | `0644` (`rw-r--r--`, root:root) | Primary service configuration file |
+| **`redsocks.service`** | `/etc/systemd/system/redsocks.service` | `0644` (`rw-r--r--`, root:root) | Systemd unit file for daemon supervision |
+
+---
+
+### Option A: Install Pre-Built Binary (Recommended)
+
+Download and extract the latest pre-compiled release from GitHub:
 
 ```bash
-cargo build --release
-```
+# 1. Download and extract the latest release tarball
+VERSION="0.1.0"
+curl -fsSL -O "https://github.com/tazihad/redsocks-rs/releases/download/v${VERSION}/redsocks-rs-v${VERSION}-linux-x86_64.tar.gz"
+tar -xzf "redsocks-rs-v${VERSION}-linux-x86_64.tar.gz"
+cd "redsocks-rs-v${VERSION}-linux-x86_64"
 
-The optimized binary will be created at:
-```bash
-./target/release/redsocks
-```
-
-To install to system path:
-```bash
-sudo cp target/release/redsocks /usr/local/bin/redsocks
-# Optional: create a redsocks-rs symlink for explicit invocation
+# 2. Install executable binary & symlink
+sudo install -m 0755 redsocks /usr/local/bin/redsocks
 sudo ln -sf /usr/local/bin/redsocks /usr/local/bin/redsocks-rs
+
+# 3. Install configuration file
+sudo install -m 0644 redsocks.conf.example /etc/redsocks.conf
+
+# 4. Install systemd service
+sudo install -m 0644 redsocks.service /etc/systemd/system/redsocks.service
+```
+
+---
+
+### Option B: Build & Install from Source
+
+```bash
+# 1. Clone repository
+git clone https://github.com/tazihad/redsocks-rs.git
+cd redsocks-rs
+
+# 2. Compile optimized release binary
+cargo build --release
+
+# 3. Install executable binary & symlink
+sudo install -m 0755 target/release/redsocks /usr/local/bin/redsocks
+sudo ln -sf /usr/local/bin/redsocks /usr/local/bin/redsocks-rs
+
+# 4. Install configuration file
+sudo install -m 0644 redsocks.conf.example /etc/redsocks.conf
+
+# 5. Install systemd service
+sudo install -m 0644 redsocks.service /etc/systemd/system/redsocks.service
+```
+
+---
+
+### Managing the Service (Systemd)
+
+After placing the files, configure and start the daemon with systemd:
+
+```bash
+# 1. Edit configuration with your proxy server details (IP, port, type, etc.)
+sudo nano /etc/redsocks.conf
+
+# 2. Test configuration syntax
+redsocks -c /etc/redsocks.conf -t
+
+# 3. Reload systemd daemon to pick up the new unit file
+sudo systemctl daemon-reload
+
+# 4. Enable service to start on system boot and start it now
+sudo systemctl enable --now redsocks
+
+# 5. Check service status
+sudo systemctl status redsocks
+
+# 6. View live logs
+journalctl -u redsocks -f
 ```
 
 ---
@@ -75,12 +169,6 @@ Options:
   -p <PIDFILE>      Write PID to specified file
   -h, --help        Print help
   -V, --version     Print version
-```
-
-### Testing Configuration Syntax
-
-```bash
-redsocks -c /etc/redsocks.conf -t
 ```
 
 ---
@@ -159,15 +247,37 @@ dnsu2t {
 
 ## Firewall Setup Guides
 
+### Understanding How `redsocks` and `iptables` Work Together
+
+1. **Interception**: An application makes an outbound TCP connection to a remote IP and port.
+2. **Redirection**: Linux `iptables` intercepts the `SYN` packet in the `OUTPUT` chain (or `PREROUTING` on a router) and executes `REDIRECT --to-ports 12345`.
+3. **Destination Recovery**: `redsocks` accepts the redirected connection on `127.0.0.1:12345` and calls the Linux kernel socket option `getsockopt(..., SO_ORIGINAL_DST, ...)` to find the real destination address the application intended to reach.
+4. **Proxy Handshake & Relay**: `redsocks` connects to the upstream proxy (SOCKS5/HTTP) and instructs it to connect to the original destination, then relays data between the client and proxy using zero-copy `splice(2)`.
+
+> [!IMPORTANT]
+> **CRITICAL: Preventing Infinite Redirection Loops**
+> When `redsocks` connects to the upstream proxy, its own connection is also outbound TCP! If `iptables` redirects `redsocks`'s connection back into `redsocks`, an infinite loop occurs and crashes the network.
+>
+> You **must** bypass proxy traffic using either of these two methods:
+> 1. **Bypass Proxy IP**: Add `-d <PROXY_IP> -j RETURN` to your rules.
+> 2. **Bypass by User/Group**: Run `redsocks` under a dedicated user (e.g. `redsocks` or `nobody`) and add `-m owner --uid-owner redsocks -j RETURN` to `OUTPUT`.
+
+---
+
 ### 1. Linux `iptables` Setup
 
-#### Redirect all outgoing TCP traffic:
+#### Scenario A: Per-Group Transparent Proxying (Recommended for Desktops)
+Only applications run within a specific group (e.g., `socksified`) are redirected through the proxy. All other system applications connect normally.
 
 ```bash
-# Create custom chain
+# 1. Create a dedicated group for socksified applications
+sudo groupadd -f socksified
+sudo usermod -aG socksified "$USER"   # log out and back in for group change to take effect
+
+# 2. Create custom REDSOCKS iptables chain
 sudo iptables -t nat -N REDSOCKS
 
-# Bypass local, private, and reserved subnets
+# 3. Bypass reserved, private, and local subnets
 sudo iptables -t nat -A REDSOCKS -d 0.0.0.0/8 -j RETURN
 sudo iptables -t nat -A REDSOCKS -d 10.0.0.0/8 -j RETURN
 sudo iptables -t nat -A REDSOCKS -d 100.64.0.0/10 -j RETURN
@@ -179,22 +289,83 @@ sudo iptables -t nat -A REDSOCKS -d 198.18.0.0/15 -j RETURN
 sudo iptables -t nat -A REDSOCKS -d 224.0.0.0/4 -j RETURN
 sudo iptables -t nat -A REDSOCKS -d 240.0.0.0/4 -j RETURN
 
-# Redirect remaining TCP traffic to redsocks listening port
+# 4. (Loop prevention) Bypass upstream proxy server IP (replace with your proxy IP)
+# sudo iptables -t nat -A REDSOCKS -d <YOUR_PROXY_SERVER_IP> -j RETURN
+
+# 5. Redirect remaining TCP packets to redsocks local port
 sudo iptables -t nat -A REDSOCKS -p tcp -j REDIRECT --to-ports 12345
 
-# Redirect traffic from a specific local group (e.g., "socksified"):
-sudo groupadd -f socksified
+# 6. Apply REDSOCKS chain only to traffic owned by the 'socksified' group
 sudo iptables -t nat -A OUTPUT -p tcp -m owner --gid-owner socksified -j REDSOCKS
 ```
 
-Run any program under transparent proxying:
+**Testing per-group transparent redirection**:
 ```bash
+# Check current public IP directly
+curl https://ifconfig.me
+
+# Run curl transparently through redsocks via the proxy
 sg socksified -c "curl https://ifconfig.me"
 ```
 
-#### Redirect router traffic from LAN interface (`eth0`):
+---
+
+#### Scenario B: System-Wide Redirection (All Local Machine TCP Traffic)
+Redirects all outgoing TCP connections from the local machine through the proxy, while exempting `redsocks` itself to prevent loops.
+
 ```bash
-sudo iptables -t nat -A PREROUTING --in-interface eth0 -p tcp -j REDSOCKS
+# 1. Create REDSOCKS chain
+sudo iptables -t nat -N REDSOCKS
+
+# 2. Bypass private & local networks
+sudo iptables -t nat -A REDSOCKS -d 0.0.0.0/8 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 10.0.0.0/8 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 100.64.0.0/10 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 127.0.0.0/8 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 169.254.0.0/16 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 172.16.0.0/12 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 192.168.0.0/16 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 198.18.0.0/15 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 224.0.0.0/4 -j RETURN
+sudo iptables -t nat -A REDSOCKS -d 240.0.0.0/4 -j RETURN
+
+# 3. Bypass upstream proxy server IP
+# sudo iptables -t nat -A REDSOCKS -d <YOUR_PROXY_SERVER_IP> -j RETURN
+
+# 4. Redirect TCP to redsocks port
+sudo iptables -t nat -A REDSOCKS -p tcp -j REDIRECT --to-ports 12345
+
+# 5. Loop prevention: bypass traffic generated by redsocks (run redsocks as 'nobody' or 'redsocks' user)
+sudo iptables -t nat -A OUTPUT -p tcp -m owner --uid-owner nobody -j RETURN
+
+# 6. Send all other outbound TCP traffic to REDSOCKS
+sudo iptables -t nat -A OUTPUT -p tcp -j REDSOCKS
+```
+
+---
+
+#### Scenario C: Router / Gateway Redirection (Transparent LAN Proxy)
+If running `redsocks-rs` on a Linux router or gateway machine to transparently proxy client devices connected on a LAN interface (e.g., `eth1` or `br0`):
+
+```bash
+# Direct incoming LAN client traffic to REDSOCKS chain
+sudo iptables -t nat -A PREROUTING --in-interface eth1 -p tcp -j REDSOCKS
+```
+
+---
+
+#### How to Teardown / Reset `iptables` Rules
+
+To revert all `redsocks` iptables rules back to normal:
+
+```bash
+# Flush custom REDSOCKS chain and remove references from OUTPUT / PREROUTING
+sudo iptables -t nat -D OUTPUT -p tcp -m owner --gid-owner socksified -j REDSOCKS 2>/dev/null || true
+sudo iptables -t nat -D OUTPUT -p tcp -m owner --uid-owner nobody -j RETURN 2>/dev/null || true
+sudo iptables -t nat -D OUTPUT -p tcp -j REDSOCKS 2>/dev/null || true
+sudo iptables -t nat -D PREROUTING --in-interface eth1 -p tcp -j REDSOCKS 2>/dev/null || true
+sudo iptables -t nat -F REDSOCKS 2>/dev/null || true
+sudo iptables -t nat -X REDSOCKS 2>/dev/null || true
 ```
 
 ---
